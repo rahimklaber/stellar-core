@@ -188,6 +188,83 @@ TEST_CASE_VERSIONS("transaction envelope bridge", "[commandhandler]")
     }
 }
 
+TEST_CASE("txdryrun", "[commandhandler]")
+{
+    VirtualClock clock;
+    auto app = createTestApplication(clock, getTestConfig());
+    auto& ch = app->getCommandHandler();
+
+    closeLedgerOn(*app, 2, 1, 1, 2017);
+    auto root = app->getRoot();
+
+    auto runDryRun = [&](TransactionEnvelope const& env) {
+        std::string ret;
+        auto blob = decoder::encode_b64(xdr::xdr_to_opaque(env));
+        ch.txdryrun("?blob=" + blob, ret);
+
+        Json::Reader reader;
+        Json::Value out;
+        REQUIRE(reader.parse(ret, out));
+        return out;
+    };
+
+    auto hasDataKey = [&](Json::Value const& changedEntries,
+                          std::string const& dataName) {
+        for (auto const& entry : changedEntries)
+        {
+            std::vector<uint8_t> keyBin;
+            decoder::decode_b64(entry["key"].asString(), keyBin);
+            LedgerKey key;
+            xdr::xdr_from_opaque(keyBin, key);
+
+            if (key.type() == DATA && key.data().accountID == root->getPublicKey() &&
+                key.data().dataName == dataName)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    SECTION("regular transaction")
+    {
+        std::string const dataName = "dryrun-data";
+        DataValue dataValue;
+        dataValue.push_back(1);
+        dataValue.push_back(2);
+        dataValue.push_back(3);
+        auto tx = root->tx({manageData(dataName, &dataValue)});
+
+        auto res = runDryRun(tx->getEnvelope());
+        REQUIRE(res["status"].asString() == "SUCCESS");
+        REQUIRE(res["changed_entries"].isArray());
+        REQUIRE(hasDataKey(res["changed_entries"], dataName));
+
+        LedgerTxn ltx(app->getLedgerTxnRoot());
+        REQUIRE(!ltx.load(dataKey(root->getPublicKey(), dataName)));
+    }
+
+    SECTION("fee-bump transaction")
+    {
+        std::string const dataName = "dryrun-fb-data";
+        DataValue dataValue;
+        dataValue.push_back(4);
+        dataValue.push_back(5);
+        dataValue.push_back(6);
+        auto innerTx = root->tx({manageData(dataName, &dataValue)});
+        auto fbTx = feeBump(*app, *root, innerTx,
+                            2 * app->getLedgerManager().getLastTxFee());
+
+        auto res = runDryRun(fbTx->getEnvelope());
+        REQUIRE(res["status"].asString() == "SUCCESS");
+        REQUIRE(res["changed_entries"].isArray());
+        REQUIRE(hasDataKey(res["changed_entries"], dataName));
+
+        LedgerTxn ltx(app->getLedgerTxnRoot());
+        REQUIRE(!ltx.load(dataKey(root->getPublicKey(), dataName)));
+    }
+}
+
 TEST_CASE("manualclose", "[commandhandler]")
 {
     auto testManualCloseConfig = [](auto configure, auto issue) {

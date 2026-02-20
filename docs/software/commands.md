@@ -342,6 +342,20 @@ Most commands return their results in JSON format.
         The network is under high load and the fee is too low.
     * "FILTERED" - transaction rejected because it contains an operation type that Stellar Core filters out. See Stellar Core configuration `EXCLUDE_TRANSACTIONS_CONTAINING_OPERATION_TYPE` for more details.
 
+* **txdryrun**
+  `txdryrun?blob=Base64`<br>
+  Dry-runs a transaction against current ledger state without committing
+  changes. Returns a JSON object with:
+  * `status`: `SUCCESS` if the tx applies in dry-run mode, else `ERROR`.
+  * `result` or `error`: Base64 encoded, XDR serialized `TransactionResult`.
+  * `changed_entries`: Array of modified ledger entries. Each item includes:
+    * `key`: Base64 encoded, XDR serialized `LedgerKey`.
+    * `action`: `CREATED`, `UPDATED`, or `REMOVED`.
+    * `before`: (optional) Base64 encoded, XDR serialized `LedgerEntry`
+      before apply.
+    * `after`: (optional) Base64 encoded, XDR serialized `LedgerEntry`
+      after apply.
+
 * **upgrades**
   * `upgrades?mode=get`<br>
     Retrieves the currently configured upgrade settings.<br>

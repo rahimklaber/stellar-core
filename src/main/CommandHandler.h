@@ -71,6 +71,7 @@ class CommandHandler
     void quorum(std::string const& params, std::string& retStr);
     void scpInfo(std::string const& params, std::string& retStr);
     void tx(std::string const& params, std::string& retStr);
+    void txdryrun(std::string const& params, std::string& retStr);
     void unban(std::string const& params, std::string& retStr);
     void upgrades(std::string const& params, std::string& retStr);
     void dumpProposedSettings(std::string const& params, std::string& retStr);

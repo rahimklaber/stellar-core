@@ -20,7 +20,9 @@
 #include "overlay/BanManager.h"
 #include "overlay/OverlayManager.h"
 #include "overlay/SurveyManager.h"
+#include "transactions/EventManager.h"
 #include "transactions/MutableTransactionResult.h"
+#include "transactions/TransactionMeta.h"
 #include "transactions/TransactionBridge.h"
 #include "transactions/TransactionUtils.h"
 #include "util/GlobalChecks.h"
@@ -122,6 +124,7 @@ CommandHandler::CommandHandler(Application& app) : mApp(app)
     addRoute("manualclose", &CommandHandler::manualClose);
     addRoute("metrics", &CommandHandler::metrics);
     addRoute("tx", &CommandHandler::tx);
+    addRoute("txdryrun", &CommandHandler::txdryrun);
     addRoute("upgrades", &CommandHandler::upgrades);
     addRoute("dumpproposedsettings", &CommandHandler::dumpProposedSettings);
     addRoute("self-check", &CommandHandler::selfCheck);
@@ -320,6 +323,92 @@ parseRequiredParam(std::map<std::string, std::string> const& map,
         throw std::runtime_error(errorMsg);
     }
     return *res;
+}
+
+std::string
+txResultToBase64(MutableTransactionResultBase const& txResult)
+{
+    auto resultBin = xdr::xdr_to_opaque(txResult.getXDR());
+    return decoder::encode_b64(resultBin);
+}
+
+Json::Value
+getChangedLedgerEntries(LedgerTxnDelta const& delta)
+{
+    Json::Value changes(Json::arrayValue);
+    for (auto const& kvp : delta.entry)
+    {
+        auto const& key = kvp.first;
+        auto const& entryDelta = kvp.second;
+        if (key.type() != InternalLedgerEntryType::LEDGER_ENTRY)
+        {
+            continue;
+        }
+
+        auto const hasBefore =
+            entryDelta.previous &&
+            entryDelta.previous->type() == InternalLedgerEntryType::LEDGER_ENTRY;
+        auto const hasAfter =
+            entryDelta.current &&
+            entryDelta.current->type() == InternalLedgerEntryType::LEDGER_ENTRY;
+
+        if (!hasBefore && !hasAfter)
+        {
+            continue;
+        }
+
+        Json::Value change;
+        change["key"] =
+            decoder::encode_b64(xdr::xdr_to_opaque(key.ledgerKey()));
+
+        if (hasBefore)
+        {
+            change["before"] = decoder::encode_b64(
+                xdr::xdr_to_opaque(entryDelta.previous->ledgerEntry()));
+        }
+        if (hasAfter)
+        {
+            change["after"] = decoder::encode_b64(
+                xdr::xdr_to_opaque(entryDelta.current->ledgerEntry()));
+        }
+
+        if (hasBefore && hasAfter)
+        {
+            change["action"] = "UPDATED";
+        }
+        else if (hasAfter)
+        {
+            change["action"] = "CREATED";
+        }
+        else
+        {
+            change["action"] = "REMOVED";
+        }
+
+        changes.append(change);
+    }
+    return changes;
+}
+
+TransactionFrameBasePtr
+transactionFromBlob(Application& app, std::string const& blob)
+{
+    TransactionEnvelope envelope;
+    std::vector<uint8_t> binBlob;
+    decoder::decode_b64(blob, binBlob);
+    xdr::xdr_from_opaque(binBlob, envelope);
+
+    {
+        auto lhhe = app.getLedgerManager().getLastClosedLedgerHeader();
+        if (protocolVersionStartsFrom(lhhe.header.ledgerVersion,
+                                      ProtocolVersion::V_13))
+        {
+            envelope = txbridge::convertForV13(envelope);
+        }
+    }
+
+    return TransactionFrameBase::makeTransactionFromWire(app.getNetworkID(),
+                                                          envelope);
 }
 } // namespace
 
@@ -1080,6 +1169,111 @@ CommandHandler::tx(std::string const& params, std::string& retStr)
     {
         throw std::invalid_argument("Must specify a tx blob: tx?blob=<tx in "
                                     "xdr format>");
+    }
+
+    retStr = Json::FastWriter().write(root);
+}
+
+void
+CommandHandler::txdryrun(std::string const& params, std::string& retStr)
+{
+    ZoneScoped;
+    Json::Value root;
+
+    std::map<std::string, std::string> paramMap;
+    http::server::server::parseParams(params, paramMap);
+    std::string blob = paramMap["blob"];
+
+    if (blob.empty())
+    {
+        throw std::invalid_argument(
+            "Must specify a tx blob: txdryrun?blob=<tx in xdr format>");
+    }
+
+    auto transaction = transactionFromBlob(mApp, blob);
+    if (!transaction)
+    {
+        throw std::invalid_argument("Failed to parse transaction envelope");
+    }
+
+    auto diagnostics =
+        DiagnosticEventManager::createForValidation(mApp.getConfig());
+    LedgerSnapshot ls(mApp);
+
+    auto const closeTime = mApp.getLedgerManager()
+                               .getLastClosedLedgerHeader()
+                               .header.scpValue.closeTime;
+    auto const ledgerVersion = ls.getLedgerHeader().current().ledgerVersion;
+    if (protocolVersionStartsFrom(ledgerVersion, ProtocolVersion::V_19))
+    {
+        ls.getLedgerHeader().currentToModify().ledgerSeq =
+            mApp.getLedgerManager().getLastClosedLedgerNum() + 1;
+    }
+
+    auto txResult = transaction->checkValid(
+        mApp.getAppConnector(), ls, 0, 0,
+        getUpperBoundCloseTimeOffset(mApp, closeTime), diagnostics);
+    if (!txResult->isSuccess())
+    {
+        root["status"] = "ERROR";
+        root["error"] = txResultToBase64(*txResult);
+
+        auto diagnosticEvents = diagnostics.finalize();
+        if (!diagnosticEvents.empty())
+        {
+            root["diagnostic_events"] =
+                decoder::encode_b64(xdr::xdr_to_opaque(diagnosticEvents));
+        }
+
+        root["changed_entries"] = Json::arrayValue;
+        retStr = Json::FastWriter().write(root);
+        return;
+    }
+
+    LedgerTxn ltx(mApp.getLedgerTxnRoot());
+    auto const baseFee = ltx.loadHeader().current().baseFee;
+    txResult = transaction->processFeeSeqNum(ltx, baseFee);
+
+    bool applySuccess = false;
+    if (txResult->isSuccess())
+    {
+        try
+        {
+            std::optional<SorobanNetworkConfig const> sorobanConfig =
+                transaction->isSoroban()
+                    ? std::optional<SorobanNetworkConfig const>(
+                          mApp.getLedgerManager()
+                              .getLastClosedSorobanNetworkConfig())
+                    : std::nullopt;
+            Hash sorobanBasePrngSeed = transaction->getContentsHash();
+
+            TransactionMetaBuilder txMetaBuilder(
+                true, *transaction, ltx.loadHeader().current().ledgerVersion,
+                mApp.getAppConnector());
+            applySuccess = transaction->apply(mApp.getAppConnector(), ltx,
+                                              txMetaBuilder, *txResult,
+                                              sorobanConfig,
+                                              sorobanBasePrngSeed);
+            transaction->processPostApply(mApp.getAppConnector(), ltx,
+                                          txMetaBuilder, *txResult);
+        }
+        catch (...)
+        {
+            txResult = transaction->createTxErrorResult(txINTERNAL_ERROR);
+        }
+    }
+
+    root["changed_entries"] = getChangedLedgerEntries(ltx.getDelta());
+
+    if (applySuccess && txResult->isSuccess())
+    {
+        root["status"] = "SUCCESS";
+        root["result"] = txResultToBase64(*txResult);
+    }
+    else
+    {
+        root["status"] = "ERROR";
+        root["error"] = txResultToBase64(*txResult);
     }
 
     retStr = Json::FastWriter().write(root);
